@@ -27,17 +27,20 @@ model Patient {
 }
 
 model Visit {
-  id          String   @id @default(uuid())
+  id          String     @id @default(uuid())
   patientId   String
-  patient     Patient  @relation(fields: [patientId], references: [id])
-
   department  Department
-
   transcript  String?
   report      Json?
+  createdAt   DateTime   @default(now())
+  patient     Patient    @relation(fields: [patientId], references: [id])
 
-  createdAt   DateTime @default(now())
+  // ← NEW
+  language    String?    // "en-IN" | "kn-IN" | "hi-IN"
+  audioUrl    String?    // optional: path to stored audio
+  messages    Json?      // full conversation turns array
 }
+
 
 enum Role {
   DOCTOR
