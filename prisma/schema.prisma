@@ -25,20 +25,31 @@ model Patient {
   visits    Visit[]
   createdAt DateTime @default(now())
 }
+enum VisitStatus {
+  WAITING
+  IN_PROGRESS
+  COMPLETED
+}
 
 model Visit {
-  id          String     @id @default(uuid())
-  patientId   String
-  department  Department
-  transcript  String?
-  report      Json?
-  createdAt   DateTime   @default(now())
-  patient     Patient    @relation(fields: [patientId], references: [id])
+  id           String      @id @default(uuid())
+  patientId    String
+  department   Department
+  transcript   String?
+  language     String?       // "en-IN" | "kn-IN" | "hi-IN"
+  audioUrl     String?
+  messages     Json?         // full conversation turns array
 
-  // ← NEW
-  language    String?    // "en-IN" | "kn-IN" | "hi-IN"
-  audioUrl    String?    // optional: path to stored audio
-  messages    Json?      // full conversation turns array
+  // ── NEW ──
+  status       VisitStatus  @default(WAITING)
+  reports      Json?         // Json array of MedicalReport objects (one per session)
+  completedAt  DateTime?     // set when doctor clicks Complete
+
+  // keep legacy single-report field for backward compat
+  report       Json?
+
+  createdAt    DateTime     @default(now())
+  patient      Patient      @relation(fields: [patientId], references: [id])
 }
 
 

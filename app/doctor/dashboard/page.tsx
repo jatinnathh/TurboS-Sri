@@ -45,7 +45,11 @@ export default async function DoctorDashboard() {
   }
 
   const visits = await prisma.visit.findMany({
-    where: { department: doctor.department },
+    where: {
+      department: doctor.department,
+      // Only show active patients — exclude completed consultations
+      status: { in: ["WAITING", "IN_PROGRESS"] },
+    },
     include: { patient: true },
     orderBy: { createdAt: "asc" },
   })

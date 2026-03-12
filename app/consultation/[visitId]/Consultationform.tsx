@@ -30,12 +30,34 @@ interface MedicalReport {
   additionalNotes:          string
 }
 
+export interface HistoryReport {
+  chiefComplaint?:  string
+  diagnosis?:       string
+  symptoms?:        string[]
+  medications?:     string[]
+  treatment?:       string[]
+  followUp?:        string
+  _savedAt?:        string
+  _sessionIndex?:   number
+  [key: string]:    unknown
+}
+
+export interface PastVisit {
+  visitId:    string
+  department: string
+  date:       string
+  language:   string
+  reports:    HistoryReport[]
+}
+
 interface Props {
-  visitId:      string
-  department:   string
-  patientName:  string
-  patientAge:   number
+  visitId:        string
+  department:     string
+  patientName:    string
+  patientAge:     number
   patientGender?: string
+  patientId:      string
+  patientHistory: PastVisit[]
 }
 
 const LANGUAGES = [
@@ -67,7 +89,7 @@ function uid()    { return Math.random().toString(36).slice(2, 9) }
 function nowTime(){ return new Date().toLocaleTimeString("en-IN", { hour:"2-digit", minute:"2-digit" }) }
 
 /* ══════════════════════════════════════════════ */
-export function ConsultationForm({ visitId, department, patientName, patientAge, patientGender }: Props) {
+export function ConsultationForm({ visitId, department, patientName, patientAge, patientGender, patientId, patientHistory }: Props) {
 
   const [sessionActive,    setSessionActive]    = useState(false)
   const [sessionSeconds,   setSessionSeconds]   = useState(0)
@@ -93,9 +115,24 @@ export function ConsultationForm({ visitId, department, patientName, patientAge,
   const [saving,           setSaving]           = useState(false)
   const [saved,            setSaved]            = useState(false)
 
+  // Completion state
+  const [completed,      setCompleted]      = useState(false)
+  const [completing,     setCompleting]     = useState(false)
+
+  // History panel state
+  const [historyOpen,    setHistoryOpen]    = useState(patientHistory.length > 0)
+  const [expandedVisit,  setExpandedVisit]  = useState<string | null>(
+    patientHistory.length > 0 ? patientHistory[0].visitId : null
+  )
+  const [expandedReport, setExpandedReport] = useState<number | null>(0)
+
   // TTS state
   const [playingMsgId,     setPlayingMsgId]     = useState<string | null>(null)
   const [ttsLoading,       setTtsLoading]       = useState<string | null>(null)
+  // Inline transcript edit state
+  const [editingMsgId,  setEditingMsgId]  = useState<string | null>(null)
+  const [editDraft,     setEditDraft]     = useState("")   // draft for the original text field
+
   const audioRef = useRef<HTMLAudioElement | null>(null)
 
   const timerRef       = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -126,6 +163,59 @@ export function ConsultationForm({ visitId, department, patientName, patientAge,
     if (lang === "kn-IN") return msg.kannada || msg.text
     return msg.text
   }
+
+  /* ── Edit a message's original text + re-translate ── */
+  const startEdit = useCallback((msg: Message) => {
+    setEditingMsgId(msg.id)
+    setEditDraft(msg.text)
+  }, [])
+
+  const cancelEdit = useCallback(() => {
+    setEditingMsgId(null)
+    setEditDraft("")
+  }, [])
+
+  const saveEdit = useCallback(async (msg: Message) => {
+    const newText = editDraft.trim()
+    if (!newText) return
+    setEditingMsgId(null)
+    setEditDraft("")
+
+    // Re-translate the corrected text to all 3 languages
+    const lang = msg.language
+    try {
+      // Translate to English first
+      const toEn = await fetch("/api/sarvam/translate", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: newText, sourceLanguage: lang }),
+      })
+      const enData = await toEn.json() as { translatedText?: string }
+      const english = lang === "en-IN" ? newText : (enData.translatedText ?? newText)
+
+      // Translate EN → HI and EN → KN in parallel
+      const [hiRes, knRes] = await Promise.all([
+        fetch("/api/sarvam/translate", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: english, sourceLanguage: "en-IN", targetLanguage: "hi-IN" }),
+        }),
+        fetch("/api/sarvam/translate", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: english, sourceLanguage: "en-IN", targetLanguage: "kn-IN" }),
+        }),
+      ])
+      const hiData = await hiRes.json() as { translatedText?: string }
+      const knData = await knRes.json() as { translatedText?: string }
+
+      setMessages(prev => prev.map(m =>
+        m.id === msg.id
+          ? { ...m, text: newText, english, hindi: hiData.translatedText ?? english, kannada: knData.translatedText ?? english }
+          : m
+      ))
+    } catch {
+      // Even if re-translation fails, at least update the original text
+      setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, text: newText } : m))
+    }
+  }, [editDraft])
 
   /* ── Transcribe + get all 3 translations ── */
   const transcribeAll = useCallback(async (blob: Blob, lang: string) => {
@@ -485,6 +575,30 @@ export function ConsultationForm({ visitId, department, patientName, patientAge,
     } finally { setSaving(false) }
   }, [messages, report, reportEdits, editingReport, visitId, patientLang])
 
+  /* ── Complete consultation ── */
+  const handleComplete = useCallback(async () => {
+    if (!report) { alert("Please generate the report before completing."); return }
+    setCompleting(true)
+    try {
+      // Save first if not already saved
+      await fetch(`/api/consultation/${visitId}/save`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages, report, language: patientLang }),
+      })
+      // Then mark complete
+      const res  = await fetch(`/api/consultation/${visitId}/complete`, { method: "POST" })
+      const data = await res.json() as { success?: boolean }
+      if (data.success) {
+        setCompleted(true)
+        setSessionActive(false)
+      }
+    } catch (err) {
+      console.error("Complete error:", err)
+    } finally {
+      setCompleting(false)
+    }
+  }, [report, visitId, messages, patientLang])
+
   const endSession = useCallback(() => {
     setSessionActive(false)
     if (messages.length) generateReport()
@@ -539,8 +653,46 @@ export function ConsultationForm({ visitId, department, patientName, patientAge,
             <div key={msg.id} style={{ alignSelf: isPat?"flex-start":"flex-end", maxWidth:"92%", animation:"slideUp 0.3s ease both" }}>
               <div style={{ background: isPat?"rgba(13,19,33,0.92)":"rgba(14,165,233,0.08)", border:`1px solid rgba(56,189,248,${isPat?0.15:0.22})`, borderRadius: isPat?"12px 12px 12px 4px":"12px 12px 4px 12px", padding:"11px 14px" }}>
 
-                {/* Original text */}
-                <div style={{ fontSize:14, color:"#e8edf5", lineHeight:1.55, marginBottom:6 }}>{msg.text}</div>
+                {/* Original text — with inline edit for doctor */}
+                {editingMsgId === msg.id ? (
+                  <div style={{ marginBottom:8 }}>
+                    <div style={{ fontSize:10, color:"#38bdf8", fontWeight:600, letterSpacing:"0.08em", marginBottom:5, display:"flex", alignItems:"center", gap:6 }}>
+                      ✏ EDITING TRANSCRIPTION
+                      <span style={{ color:"#4a5568", fontWeight:400, fontSize:9 }}>Correct the transcribed text, then save to re-translate</span>
+                    </div>
+                    <textarea
+                      value={editDraft}
+                      onChange={e => setEditDraft(e.target.value)}
+                      autoFocus
+                      rows={3}
+                      style={{
+                        width:"100%", background:"rgba(56,189,248,0.05)",
+                        border:"1.5px solid rgba(56,189,248,0.35)", borderRadius:8,
+                        padding:"9px 11px", fontSize:14, color:"#e8edf5",
+                        fontFamily:"'DM Sans',sans-serif", outline:"none",
+                        resize:"vertical" as const, lineHeight:1.55,
+                        caretColor:"#38bdf8",
+                      }}
+                    />
+                    <div style={{ display:"flex", gap:7, marginTop:6 }}>
+                      <button
+                        onClick={() => saveEdit(msg)}
+                        disabled={!editDraft.trim()}
+                        style={{ flex:1, background:"linear-gradient(135deg,#38bdf8,#0ea5e9)", color:"#080c14", border:"none", borderRadius:7, padding:"6px 0", fontSize:12, fontWeight:700, fontFamily:"'DM Sans',sans-serif", cursor:"pointer" }}
+                      >
+                        ✓ Save & Re-translate
+                      </button>
+                      <button
+                        onClick={cancelEdit}
+                        style={{ background:"rgba(239,68,68,0.1)", color:"#ef4444", border:"1px solid rgba(239,68,68,0.25)", borderRadius:7, padding:"6px 14px", fontSize:12, fontWeight:600, fontFamily:"'DM Sans',sans-serif", cursor:"pointer" }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ fontSize:14, color:"#e8edf5", lineHeight:1.55, marginBottom:6 }}>{msg.text}</div>
+                )}
 
                 {/* All 3 translations */}
                 <div style={{ borderTop:"1px solid rgba(56,189,248,0.08)", paddingTop:8, display:"flex", flexDirection:"column", gap:5 }}>
@@ -561,6 +713,23 @@ export function ConsultationForm({ visitId, department, patientName, patientAge,
                   <div style={{ display:"flex", gap:7, alignItems:"center" }}>
                     <span style={{ fontSize:11, color:"#4a5568" }}>{msg.timestamp}</span>
                     <span style={{ fontSize:10, color:"#4a5568", background:"rgba(56,189,248,0.06)", borderRadius:4, padding:"1px 6px" }}>🎤 {LANG_LABELS[msg.language]}</span>
+                    {/* Edit transcription button — always visible, hides while editing */}
+                    {editingMsgId !== msg.id && (
+                      <button
+                        onClick={() => startEdit(msg)}
+                        title="Edit transcription"
+                        style={{
+                          background:"transparent", border:"1px solid rgba(56,189,248,0.15)",
+                          borderRadius:5, padding:"1px 7px", fontSize:10, color:"#4a5568",
+                          cursor:"pointer", fontFamily:"'DM Sans',sans-serif",
+                          display:"flex", alignItems:"center", gap:3, transition:"all 0.15s",
+                        }}
+                        onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.color="#38bdf8"; (e.currentTarget as HTMLButtonElement).style.borderColor="rgba(56,189,248,0.4)" }}
+                        onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color="#4a5568"; (e.currentTarget as HTMLButtonElement).style.borderColor="rgba(56,189,248,0.15)" }}
+                      >
+                        ✏ Edit
+                      </button>
+                    )}
                   </div>
 
                   {/* TTS: 3 language play buttons for doctor messages */}
@@ -712,14 +881,126 @@ export function ConsultationForm({ visitId, department, patientName, patientAge,
         </span>
       </div>
 
-      {/* ── Dual panels ── */}
+      {/* ── History sidebar + dual panels ── */}
       <div style={{ flex:1, display:"flex", overflow:"hidden", minHeight:0 }}>
-        {renderPanel("patient")}
-        <div style={{ width:44,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,background:"rgba(8,12,20,0.25)" }}>
-          <div style={{ width:28,height:28,borderRadius:"50%",background:"rgba(56,189,248,0.05)",border:"1px solid rgba(56,189,248,0.1)",display:"flex",alignItems:"center",justifyContent:"center",color:"#4a5568",fontSize:12 }}>⇄</div>
+
+        {/* ── Patient History Sidebar ── */}
+        {patientHistory.length > 0 && (
+          <div style={{
+            width: historyOpen ? 280 : 36, flexShrink:0, transition:"width 0.25s ease",
+            borderRight:"1px solid rgba(56,189,248,0.1)", background:"rgba(8,12,20,0.7)",
+            display:"flex", flexDirection:"column", overflow:"hidden",
+          }}>
+            {/* Sidebar toggle header */}
+            <div
+              onClick={() => setHistoryOpen(o => !o)}
+              style={{ padding:"10px 12px", borderBottom:"1px solid rgba(56,189,248,0.08)", display:"flex", alignItems:"center", gap:8, cursor:"pointer", flexShrink:0, background:"rgba(13,19,33,0.6)" }}
+            >
+              <span style={{ fontSize:14 }}>🕐</span>
+              {historyOpen && (
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ fontSize:12, fontWeight:700, color:"#e8edf5" }}>Patient History</div>
+                  <div style={{ fontSize:10, color:"#4a5568" }}>{patientHistory.length} past visit{patientHistory.length!==1?"s":""}</div>
+                </div>
+              )}
+              <span style={{ fontSize:11, color:"#38bdf8", marginLeft:"auto" }}>{historyOpen ? "◀" : "▶"}</span>
+            </div>
+
+            {/* History list */}
+            {historyOpen && (
+              <div style={{ flex:1, overflowY:"auto", padding:"8px" }}>
+                {patientHistory.map((visit, vi) => {
+                  const isExpanded = expandedVisit === visit.visitId
+                  const date       = new Date(visit.date)
+                  const dateStr    = date.toLocaleDateString("en-IN", { day:"numeric", month:"short", year:"numeric" })
+
+                  return (
+                    <div key={visit.visitId} style={{ marginBottom:8 }}>
+                      {/* Visit header */}
+                      <div
+                        onClick={() => setExpandedVisit(isExpanded ? null : visit.visitId)}
+                        style={{
+                          background: isExpanded ? "rgba(56,189,248,0.1)" : "rgba(13,19,33,0.8)",
+                          border:`1px solid rgba(56,189,248,${isExpanded?0.3:0.1})`,
+                          borderRadius:8, padding:"9px 10px", cursor:"pointer",
+                          display:"flex", flexDirection:"column", gap:3,
+                        }}
+                      >
+                        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                          <span style={{ fontSize:11, fontWeight:700, color: isExpanded?"#38bdf8":"#e8edf5" }}>
+                            {visit.department.replace(/_/g," ")}
+                          </span>
+                          <span style={{ fontSize:9, color:"#4a5568" }}>{isExpanded?"▲":"▼"}</span>
+                        </div>
+                        <span style={{ fontSize:10, color:"#4a5568" }}>{dateStr}</span>
+                        <span style={{ fontSize:10, color:"#8b9ab5" }}>
+                          {visit.reports.length} report{visit.reports.length!==1?"s":""}
+                        </span>
+                      </div>
+
+                      {/* Reports for this visit */}
+                      {isExpanded && visit.reports.map((rep, ri) => {
+                        const isRepExpanded = expandedVisit === visit.visitId && expandedReport === ri
+                        const savedAt = rep._savedAt ? new Date(rep._savedAt as string).toLocaleTimeString("en-IN", { hour:"2-digit", minute:"2-digit" }) : ""
+                        return (
+                          <div key={ri} style={{ marginTop:4, marginLeft:8, borderLeft:"2px solid rgba(56,189,248,0.15)", paddingLeft:8 }}>
+                            {/* Report header */}
+                            <div
+                              onClick={() => setExpandedReport(isRepExpanded ? null : ri)}
+                              style={{ padding:"7px 8px", background:"rgba(8,12,20,0.9)", borderRadius:6, cursor:"pointer", border:"1px solid rgba(56,189,248,0.08)" }}
+                            >
+                              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                                <span style={{ fontSize:10, fontWeight:600, color:"#38bdf8" }}>
+                                  Report {typeof rep._sessionIndex === "number" ? rep._sessionIndex : ri + 1}
+                                </span>
+                                <span style={{ fontSize:9, color:"#4a5568" }}>{savedAt} {isRepExpanded?"▲":"▼"}</span>
+                              </div>
+                              {rep.diagnosis && (
+                                <div style={{ fontSize:10, color:"#8b9ab5", marginTop:3, lineHeight:1.4 }}>
+                                  Dx: {String(rep.diagnosis).slice(0,60)}{String(rep.diagnosis).length > 60 ? "…" : ""}
+                                </div>
+                              )}
+                            </div>
+
+                            {/* Expanded report detail */}
+                            {isRepExpanded && (
+                              <div style={{ background:"rgba(8,12,20,0.95)", border:"1px solid rgba(56,189,248,0.1)", borderRadius:"0 0 7px 7px", padding:"9px 10px", display:"flex", flexDirection:"column", gap:7 }}>
+                                {[
+                                  { label:"Chief Complaint", value: rep.chiefComplaint },
+                                  { label:"Diagnosis",       value: rep.diagnosis       },
+                                  { label:"Symptoms",        value: Array.isArray(rep.symptoms) ? (rep.symptoms as string[]).join(", ") : rep.symptoms },
+                                  { label:"Medications",     value: Array.isArray(rep.medications) ? (rep.medications as string[]).join(", ") : rep.medications },
+                                  { label:"Treatment",       value: Array.isArray(rep.treatment)  ? (rep.treatment  as string[]).join(", ") : rep.treatment  },
+                                  { label:"Follow-up",       value: rep.followUp        },
+                                ].filter(f => f.value).map(f => (
+                                  <div key={f.label}>
+                                    <div style={{ fontSize:9, fontWeight:700, color:"#38bdf8", textTransform:"uppercase" as const, letterSpacing:"0.07em", marginBottom:2 }}>{f.label}</div>
+                                    <div style={{ fontSize:11, color:"#c8d6e8", lineHeight:1.5 }}>{String(f.value)}</div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Consultation panels ── */}
+        <div style={{ flex:1, display:"flex", overflow:"hidden", minHeight:0 }}>
+          {renderPanel("patient")}
+          <div style={{ width:44,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,background:"rgba(8,12,20,0.25)" }}>
+            <div style={{ width:28,height:28,borderRadius:"50%",background:"rgba(56,189,248,0.05)",border:"1px solid rgba(56,189,248,0.1)",display:"flex",alignItems:"center",justifyContent:"center",color:"#4a5568",fontSize:12 }}>⇄</div>
+          </div>
+          {renderPanel("doctor")}
         </div>
-        {renderPanel("doctor")}
       </div>
+
 
       {/* ── Bottom panel ── */}
       <div style={{ height:310,flexShrink:0,borderTop:"1px solid rgba(56,189,248,0.12)",background:"rgba(10,15,26,0.97)",display:"flex",flexDirection:"column" }}>
@@ -765,6 +1046,30 @@ export function ConsultationForm({ visitId, department, patientName, patientAge,
             <button onClick={handleSave} disabled={saving||!messages.length} style={{ background:"linear-gradient(135deg,#38bdf8,#0ea5e9)",color:"#080c14",padding:"5px 18px",borderRadius:7,border:"none",fontSize:12,fontWeight:700,fontFamily:"'DM Sans',sans-serif",cursor:messages.length?"pointer":"not-allowed",opacity:messages.length?1:0.5,display:"flex",alignItems:"center",gap:5 }}>
               {saving ? <><span style={{ width:11,height:11,border:"1.5px solid rgba(8,12,20,0.3)",borderTopColor:"#080c14",borderRadius:"50%",animation:"spin 0.7s linear infinite",display:"inline-block" }} /> Saving…</> : saved ? "✓ Saved!" : "💾 Save"}
             </button>
+            {/* Complete Consultation button — shown only after report is generated */}
+            {report && !completed && (
+              <button
+                onClick={handleComplete}
+                disabled={completing}
+                style={{
+                  background: completing ? "rgba(52,211,153,0.1)" : "linear-gradient(135deg,#34d399,#10b981)",
+                  color:"#080c14", padding:"5px 18px", borderRadius:7, border:"none",
+                  fontSize:12, fontWeight:700, fontFamily:"'DM Sans',sans-serif",
+                  cursor: completing ? "not-allowed" : "pointer",
+                  display:"flex", alignItems:"center", gap:5,
+                }}
+              >
+                {completing
+                  ? <><span style={{ width:11,height:11,border:"1.5px solid rgba(8,12,20,0.3)",borderTopColor:"#080c14",borderRadius:"50%",animation:"spin 0.7s linear infinite",display:"inline-block" }} /> Completing...</>
+                  : "✅ Complete"
+                }
+              </button>
+            )}
+            {completed && (
+              <div style={{ display:"flex",alignItems:"center",gap:6,background:"rgba(52,211,153,0.1)",border:"1px solid rgba(52,211,153,0.3)",borderRadius:7,padding:"5px 14px",fontSize:12,fontWeight:600,color:"#34d399",flexShrink:0 }}>
+                ✓ Completed
+              </div>
+            )}
           </div>
         </div>
 
